@@ -55,18 +55,15 @@ jobs:
 
           Write-Host ""
           Write-Host "Compilador:"
-
           where.exe cl
           cl 2>&1 | Select-Object -First 5
 
           Write-Host ""
           Write-Host "NMake:"
-
           where.exe nmake
 
           Write-Host ""
           Write-Host "Git:"
-
           git --version
 
       - name: Crear directorios
@@ -176,9 +173,20 @@ jobs:
           $phpSource = Join-Path $phpBuildRoot "php-src"
           $phpDeps = Join-Path $phpBuildRoot "deps"
 
-          "PHP_BUILD_ROOT=$phpBuildRoot" >> $env:GITHUB_ENV
-          "PHP_SOURCE=$phpSource" >> $env:GITHUB_ENV
-          "PHP_DEPS=$phpDeps" >> $env:GITHUB_ENV
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "PHP_BUILD_ROOT=$phpBuildRoot" `
+            -Encoding utf8
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "PHP_SOURCE=$phpSource" `
+            -Encoding utf8
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "PHP_DEPS=$phpDeps" `
+            -Encoding utf8
 
           Write-Host "PHP_BUILD_ROOT=$phpBuildRoot"
           Write-Host "PHP_SOURCE=$phpSource"
@@ -237,7 +245,7 @@ jobs:
           git -C $env:SQLCIPHER_SOURCE describe --tags --always
 
       # ============================================================
-      # DEPENDENCIAS PHP
+      # DEPENDENCIAS DE PHP
       # ============================================================
 
       - name: Descargar dependencias oficiales de PHP
@@ -309,18 +317,27 @@ jobs:
       - name: Localizar OpenSSL
         shell: pwsh
         run: |
-          $opensslHeader = Get-ChildItem `
-            -Path $env:PHP_DEPS `
-            -Filter "evp.h" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.FullName -match "[\\/]openssl[\\/]evp\.h$"
-            } |
-            Select-Object -First 1
+          $defaultHeader = Join-Path `
+            $env:PHP_DEPS `
+            "include\openssl\evp.h"
+
+          if (Test-Path $defaultHeader) {
+            $opensslHeader = Get-Item $defaultHeader
+          } else {
+            $opensslHeader = Get-ChildItem `
+              -Path $env:PHP_DEPS `
+              -Filter "evp.h" `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.FullName -match '[\\/]include[\\/]openssl[\\/]evp\.h$'
+              } |
+              Select-Object -First 1
+          }
 
           if (-not $opensslHeader) {
-            throw "No se encontró openssl\evp.h."
+            throw "No se encontró include\openssl\evp.h."
           }
 
           $opensslDirectory = Split-Path `
@@ -331,23 +348,41 @@ jobs:
             $opensslDirectory `
             -Parent
 
-          $libcrypto = Get-ChildItem `
-            -Path $env:PHP_DEPS `
-            -Filter "libcrypto.lib" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+          $defaultLibcrypto = Join-Path `
+            $env:PHP_DEPS `
+            "lib\libcrypto.lib"
+
+          if (Test-Path $defaultLibcrypto) {
+            $libcrypto = Get-Item $defaultLibcrypto
+          } else {
+            $libcrypto = Get-ChildItem `
+              -Path $env:PHP_DEPS `
+              -Filter "libcrypto.lib" `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
 
           if (-not $libcrypto) {
             throw "No se encontró libcrypto.lib."
           }
 
-          $libssl = Get-ChildItem `
-            -Path $env:PHP_DEPS `
-            -Filter "libssl.lib" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+          $defaultLibssl = Join-Path `
+            $env:PHP_DEPS `
+            "lib\libssl.lib"
+
+          if (Test-Path $defaultLibssl) {
+            $libssl = Get-Item $defaultLibssl
+          } else {
+            $libssl = Get-ChildItem `
+              -Path $env:PHP_DEPS `
+              -Filter "libssl.lib" `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
 
           if (-not $libssl) {
             throw "No se encontró libssl.lib."
@@ -355,8 +390,15 @@ jobs:
 
           $opensslLib = $libcrypto.Directory.FullName
 
-          "OPENSSL_INCLUDE=$opensslInclude" >> $env:GITHUB_ENV
-          "OPENSSL_LIB=$opensslLib" >> $env:GITHUB_ENV
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "OPENSSL_INCLUDE=$opensslInclude" `
+            -Encoding utf8
+
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "OPENSSL_LIB=$opensslLib" `
+            -Encoding utf8
 
           Write-Host "OPENSSL_INCLUDE=$opensslInclude"
           Write-Host "OPENSSL_LIB=$opensslLib"
@@ -421,8 +463,6 @@ jobs:
 
           cd /d "%SQLCIPHER_SOURCE%"
 
-          echo Limpiando archivos generados...
-
           del /q sqlite3.c 2>nul
           del /q sqlite3.h 2>nul
           del /q sqlite3ext.h 2>nul
@@ -432,15 +472,11 @@ jobs:
           del /q opcodes.c 2>nul
           del /q opcodes.h 2>nul
           del /q pragma.h 2>nul
-
           del /q lemon.exe 2>nul
           del /q lemon.obj 2>nul
           del /q lemon.pdb 2>nul
-
           del /q jimsh0.exe 2>nul
           del /q jimsh0.obj 2>nul
-
-          echo Generando amalgamacion SQLCipher...
 
           nmake /nologo /f Makefile.msc sqlite3.c ^
             PLATFORM=x64 ^
@@ -472,8 +508,6 @@ jobs:
             exit /b 1
           )
 
-          echo Amalgamacion SQLCipher generada correctamente.
-
           exit /b 0
           '@
 
@@ -503,7 +537,7 @@ jobs:
             }
 
             Get-Item $requiredFile |
-              Select-Object FullName, Length, LastWriteTime
+              Select-Object FullName, Length
           }
 
       - name: Compilar SQLCipher DLL
@@ -571,8 +605,6 @@ jobs:
             echo ERROR: No se genero sqlite3.lib.
             exit /b 1
           )
-
-          echo SQLCipher compilado correctamente.
 
           exit /b 0
           '@
@@ -664,7 +696,7 @@ jobs:
           }
 
       # ============================================================
-      # PHP
+      # COMPILAR PHP
       # ============================================================
 
       - name: Ejecutar buildconf
@@ -697,12 +729,6 @@ jobs:
 
           if ($LASTEXITCODE -ne 0) {
             throw "Falló buildconf."
-          }
-
-          if (-not (
-            Test-Path "$env:PHP_SOURCE\configure.bat"
-          )) {
-            throw "No se generó configure.bat."
           }
 
       - name: Configurar PHP
@@ -828,7 +854,7 @@ jobs:
           }
 
       # ============================================================
-      # SALIDA
+      # LOCALIZAR RESULTADOS
       # ============================================================
 
       - name: Localizar PHP compilado
@@ -838,11 +864,22 @@ jobs:
             -Path $env:PHP_SOURCE `
             -Filter "php.exe" `
             -Recurse `
+            -File `
             -ErrorAction SilentlyContinue |
             Where-Object {
-              $_.Directory.Name -eq "Release"
+              $_.FullName -match '[\\/]x64[\\/]Release[\\/]php\.exe$'
             } |
             Select-Object -First 1
+
+          if (-not $phpExecutable) {
+            $phpExecutable = Get-ChildItem `
+              -Path $env:PHP_SOURCE `
+              -Filter "php.exe" `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
 
           if (-not $phpExecutable) {
             throw "No se encontró php.exe."
@@ -850,7 +887,10 @@ jobs:
 
           $releaseDirectory = $phpExecutable.Directory.FullName
 
-          "PHP_RELEASE=$releaseDirectory" >> $env:GITHUB_ENV
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "PHP_RELEASE=$releaseDirectory" `
+            -Encoding utf8
 
           Write-Host "PHP_RELEASE=$releaseDirectory"
 
@@ -861,29 +901,70 @@ jobs:
             -Path $env:PHP_SOURCE `
             -Filter "php_pdo_sqlite.dll" `
             -Recurse `
+            -File `
             -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '[\\/]x64[\\/]Release[\\/]'
+            } |
             Select-Object -First 1
 
           $phpSqlite3Dll = Get-ChildItem `
             -Path $env:PHP_SOURCE `
             -Filter "php_sqlite3.dll" `
             -Recurse `
+            -File `
             -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match '[\\/]x64[\\/]Release[\\/]'
+            } |
             Select-Object -First 1
 
           if (-not $pdoSqliteDll) {
+            Write-Host "DLL generadas:"
+
+            Get-ChildItem `
+              -Path $env:PHP_SOURCE `
+              -Filter "*.dll" `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object FullName, Length
+
             throw "No se generó php_pdo_sqlite.dll."
           }
 
           if (-not $phpSqlite3Dll) {
+            Write-Host "DLL generadas:"
+
+            Get-ChildItem `
+              -Path $env:PHP_SOURCE `
+              -Filter "*.dll" `
+              -Recurse `
+              -File `
+              -ErrorAction SilentlyContinue |
+              Select-Object FullName, Length
+
             throw "No se generó php_sqlite3.dll."
           }
 
-          "PDO_SQLITE_DLL=$($pdoSqliteDll.FullName)" >>
-            $env:GITHUB_ENV
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "PDO_SQLITE_DLL=$($pdoSqliteDll.FullName)" `
+            -Encoding utf8
 
-          "PHP_SQLITE3_DLL=$($phpSqlite3Dll.FullName)" >>
-            $env:GITHUB_ENV
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "PHP_SQLITE3_DLL=$($phpSqlite3Dll.FullName)" `
+            -Encoding utf8
+
+          Get-Item `
+            $pdoSqliteDll.FullName, `
+            $phpSqlite3Dll.FullName |
+            Select-Object FullName, Length
+
+      # ============================================================
+      # PREPARAR DISTRIBUCIÓN
+      # ============================================================
 
       - name: Preparar distribución
         shell: pwsh
@@ -910,13 +991,13 @@ jobs:
             -Force
 
           Copy-Item `
-            $env:PDO_SQLITE_DLL `
-            "$env:OUTPUT_DIRECTORY\ext\php_pdo_sqlite.dll" `
+            -Path $env:PDO_SQLITE_DLL `
+            -Destination "$env:OUTPUT_DIRECTORY\ext\php_pdo_sqlite.dll" `
             -Force
 
           Copy-Item `
-            $env:PHP_SQLITE3_DLL `
-            "$env:OUTPUT_DIRECTORY\ext\php_sqlite3.dll" `
+            -Path $env:PHP_SQLITE3_DLL `
+            -Destination "$env:OUTPUT_DIRECTORY\ext\php_sqlite3.dll" `
             -Force
 
           Get-ChildItem `
@@ -926,15 +1007,14 @@ jobs:
             -ErrorAction SilentlyContinue |
             ForEach-Object {
               Copy-Item `
-                $_.FullName `
-                $env:OUTPUT_DIRECTORY `
+                -Path $_.FullName `
+                -Destination $env:OUTPUT_DIRECTORY `
                 -Force
             }
 
-          # SQLCipher debe reemplazar cualquier sqlite3.dll convencional.
           Copy-Item `
-            "$env:SQLCIPHER_SOURCE\sqlite3.dll" `
-            "$env:OUTPUT_DIRECTORY\sqlite3.dll" `
+            -Path "$env:SQLCIPHER_SOURCE\sqlite3.dll" `
+            -Destination "$env:OUTPUT_DIRECTORY\sqlite3.dll" `
             -Force
 
       - name: Crear php.ini
@@ -964,7 +1044,7 @@ jobs:
             -Encoding ascii
 
       # ============================================================
-      # PRUEBAS
+      # VALIDACIONES
       # ============================================================
 
       - name: Verificar archivos
@@ -1334,7 +1414,10 @@ jobs:
             throw "No se generó el ZIP."
           }
 
-          "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+          Add-Content `
+            -Path $env:GITHUB_ENV `
+            -Value "ZIP_PATH=$zipPath" `
+            -Encoding utf8
 
           Get-Item $zipPath |
             Select-Object FullName, Length
