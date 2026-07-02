@@ -40,6 +40,7 @@ jobs:
         run: |
           where.exe cl
           where.exe nmake
+          where.exe tar
           if ($env:VisualStudioVersion -notmatch '^17\.') { throw 'Se requiere Visual Studio 2022.' }
 
           $candidates = @(
@@ -55,12 +56,35 @@ jobs:
           & "$env:GITHUB_WORKSPACE\spc\bin\spc.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'No se pudo ejecutar SPC.' }
 
-      - name: Descargar dependencias
+      - name: Descargar dependencias y fijar PHP 8.5.7
         shell: pwsh
         working-directory: spc
         run: |
           .\bin\spc.exe download --with-php=$env:PHP_BRANCH --for-extensions="$env:PHP_EXTENSIONS" --prefer-pre-built
           if ($LASTEXITCODE -ne 0) { throw 'Falló spc download.' }
+
+          $sdkBin = "$env:GITHUB_WORKSPACE\spc\php-sdk-binary-tools\bin"
+          New-Item -ItemType Directory -Force -Path $sdkBin | Out-Null
+
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { throw 'No se encontró 7-Zip en el runner.' }
+          Copy-Item $sevenZip "$sdkBin\7za.exe" -Force
+          if (-not (Test-Path "$sdkBin\7za.exe")) { throw 'No se pudo preparar 7za.exe para SPC.' }
+
+          $phpArchive = Get-ChildItem '.\downloads\php-8.5.*.tar.xz' | Select-Object -First 1
+          if (-not $phpArchive) { throw 'SPC no descargó el archivo fuente de PHP 8.5.' }
+
+          Invoke-WebRequest `
+            -Uri "https://www.php.net/distributions/php-$env:PHP_VERSION_EXPECTED.tar.xz" `
+            -OutFile $phpArchive.FullName
+
+          if ((Get-Item $phpArchive.FullName).Length -lt 1000000) {
+            throw 'El archivo PHP 8.5.7 descargado no es válido.'
+          }
+
+          Write-Host "Archivo PHP fijado: $($phpArchive.FullName)"
+          Write-Host "7za preparado: $sdkBin\7za.exe"
+
           .\bin\spc.exe extract sqlite
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path '.\source\sqlite')) { throw 'Falló spc extract sqlite.' }
 
