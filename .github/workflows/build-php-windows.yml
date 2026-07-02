@@ -1,15 +1,15 @@
-name: v1 Build PHP Windows SQLCipher
+name: Build PHP with SQLCipher for Windows
 
 on:
   workflow_dispatch:
     inputs:
       php_version:
-        description: Versión de PHP
+        description: "Versión exacta de PHP"
         required: true
         default: "8.5.7"
 
       sqlcipher_version:
-        description: Versión de SQLCipher
+        description: "Versión exacta de SQLCipher"
         required: true
         default: "4.16.0"
 
@@ -18,116 +18,119 @@ permissions:
 
 jobs:
   build:
-    name: v1 PHP Windows x64 con SQLCipher
+    name: PHP ${{ inputs.php_version }} + SQLCipher ${{ inputs.sqlcipher_version }}
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     env:
       PHP_VERSION: ${{ inputs.php_version }}
       SQLCIPHER_VERSION: ${{ inputs.sqlcipher_version }}
 
-      BUILD_ROOT: C:\build
-      PHP_SDK: C:\build\php-sdk
-      PHP_SOURCE: C:\build\php-src
+      PHP_SDK: C:\php-sdk
+      PHP_TREE_NAME: phpdev
+
       SQLCIPHER_SOURCE: C:\build\sqlcipher
       OUTPUT_DIRECTORY: C:\build\output
+      PACKAGE_DIRECTORY: C:\build\package
 
     steps:
-      - name: Descargar repositorio
+      # ----------------------------------------------------------------------
+      # PREPARACIÓN DEL ENTORNO
+      # ----------------------------------------------------------------------
+
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Mostrar entorno
-        shell: pwsh
-        run: |
-          Write-Host "PHP: $env:PHP_VERSION"
-          Write-Host "SQLCipher: $env:SQLCIPHER_VERSION"
-
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version, OSArchitecture
-
-      - name: Preparar Visual Studio
+      - name: Configurar Visual Studio 2022 x64
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Verificar herramientas
+      - name: Mostrar información del entorno
         shell: pwsh
         run: |
+          Write-Host "PHP_VERSION=$env:PHP_VERSION"
+          Write-Host "SQLCIPHER_VERSION=$env:SQLCIPHER_VERSION"
+
+          Write-Host ""
+          Write-Host "Sistema operativo:"
+
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture
+
+          Write-Host ""
+          Write-Host "Visual Studio:"
+
           where.exe cl
+          cl 2>&1 | Select-Object -First 5
+
+          Write-Host ""
+          Write-Host "NMake:"
+
           where.exe nmake
-          where.exe git
-          where.exe cmake
 
-          cl 2>&1 |
-            Select-Object -First 5
+          Write-Host ""
+          Write-Host "Git:"
 
-      - name: Crear directorios
+          git --version
+
+      - name: Crear directorios base
         shell: pwsh
         run: |
           New-Item `
             -ItemType Directory `
             -Force `
             -Path `
-              $env:BUILD_ROOT, `
-              $env:PHP_SDK, `
-              $env:PHP_SOURCE, `
+              C:\build, `
               $env:SQLCIPHER_SOURCE, `
-              $env:OUTPUT_DIRECTORY |
+              $env:OUTPUT_DIRECTORY, `
+              $env:PACKAGE_DIRECTORY |
             Out-Null
+
+      # ----------------------------------------------------------------------
+      # PHP SDK
+      # ----------------------------------------------------------------------
 
       - name: Descargar PHP SDK
         shell: pwsh
         run: |
+          if (Test-Path $env:PHP_SDK) {
+            Remove-Item `
+              $env:PHP_SDK `
+              -Recurse `
+              -Force
+          }
+
           git clone `
             --depth 1 `
-            --branch php-sdk-2.7.1 `
             https://github.com/php/php-sdk-binary-tools.git `
             $env:PHP_SDK
 
-      - name: Descargar código fuente de PHP
+          if (-not (
+            Test-Path "$env:PHP_SDK\phpsdk-vs17-x64.bat"
+          )) {
+            throw "No se encontró phpsdk-vs17-x64.bat."
+          }
+
+          Write-Host "PHP SDK descargado correctamente."
+
+      - name: Crear árbol oficial PHP SDK
         shell: pwsh
         run: |
-          git clone `
-            --depth 1 `
-            --branch "php-$env:PHP_VERSION" `
-            https://github.com/php/php-src.git `
-            $env:PHP_SOURCE
-
-      - name: Descargar SQLCipher
-        shell: pwsh
-        run: |
-          git clone `
-            --depth 1 `
-            --branch "v$env:SQLCIPHER_VERSION" `
-            https://github.com/sqlcipher/sqlcipher.git `
-            $env:SQLCIPHER_SOURCE
-
-      - name: Verificar fuentes descargadas
-        shell: pwsh
-        run: |
-          Write-Host "PHP:"
-          git -C $env:PHP_SOURCE describe --tags --always
-
-          Write-Host "SQLCipher:"
-          git -C $env:SQLCIPHER_SOURCE describe --tags --always
-
-      - name: Descargar dependencias de PHP
-        shell: pwsh
-        run: |
-          $phpBranch = ($env:PHP_VERSION -split '\.')[0..1] -join '.'
-
-          $task = @"
+          $task = @'
           @echo off
-          cd /d "%PHP_SOURCE%"
+          setlocal
 
-          call phpsdk_deps --update --branch $phpBranch
+          cd /d "%PHP_SDK%"
+
+          call phpsdk_buildtree %PHP_TREE_NAME%
 
           if errorlevel 1 exit /b %errorlevel%
-          "@
 
-          $taskPath = Join-Path `
-            $env:BUILD_ROOT `
-            "deps-task.cmd"
+          exit /b 0
+          '@
+
+          $taskPath = "C:\build\create-buildtree.cmd"
 
           Set-Content `
             -Path $taskPath `
@@ -138,59 +141,252 @@ jobs:
             "`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Falló phpsdk_deps con código $LASTEXITCODE"
+            throw "Falló phpsdk_buildtree."
           }
 
-      - name: Localizar dependencias de PHP
+      - name: Localizar árbol x64 generado
         shell: pwsh
         run: |
-          $depsRoot = Get-ChildItem `
-            -Path $env:BUILD_ROOT `
+          $treeRoot = Join-Path `
+            $env:PHP_SDK `
+            $env:PHP_TREE_NAME
+
+          if (-not (Test-Path $treeRoot)) {
+            throw "No existe el árbol PHP SDK: $treeRoot"
+          }
+
+          $architectureRoot = Get-ChildItem `
+            -Path $treeRoot `
             -Directory `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
+            -Recurse |
             Where-Object {
-              (Test-Path (
-                Join-Path $_.FullName "include\openssl\evp.h"
-              )) -and (
-                Test-Path (
-                  Join-Path $_.FullName "lib\libcrypto.lib"
-                )
-              )
+              $_.Name -eq "x64" -and
+              $_.Parent.Name -match "^vs[0-9]+$"
             } |
             Select-Object -First 1
 
-          if (-not $depsRoot) {
-            throw "No se encontró el directorio de dependencias PHP."
+          if (-not $architectureRoot) {
+            Write-Host "Contenido del árbol:"
+
+            Get-ChildItem `
+              -Path $treeRoot `
+              -Directory `
+              -Recurse |
+              Select-Object FullName
+
+            throw "No se encontró el directorio vsXX\x64."
           }
 
-          $phpDeps = $depsRoot.FullName
-          $opensslInclude = Join-Path $phpDeps "include"
-          $opensslLib = Join-Path $phpDeps "lib"
+          $buildRoot = $architectureRoot.FullName
+          $phpSource = Join-Path $buildRoot "php-src"
+          $phpDeps = Join-Path $buildRoot "deps"
 
+          "PHP_BUILD_ROOT=$buildRoot" >> $env:GITHUB_ENV
+          "PHP_SOURCE=$phpSource" >> $env:GITHUB_ENV
           "PHP_DEPS=$phpDeps" >> $env:GITHUB_ENV
+
+          Write-Host "PHP_BUILD_ROOT=$buildRoot"
+          Write-Host "PHP_SOURCE=$phpSource"
+          Write-Host "PHP_DEPS=$phpDeps"
+
+      # ----------------------------------------------------------------------
+      # CÓDIGO FUENTE
+      # ----------------------------------------------------------------------
+
+      - name: Descargar código fuente de PHP
+        shell: pwsh
+        run: |
+          if (Test-Path $env:PHP_SOURCE) {
+            Remove-Item `
+              $env:PHP_SOURCE `
+              -Recurse `
+              -Force
+          }
+
+          git clone `
+            --depth 1 `
+            --branch "php-$env:PHP_VERSION" `
+            https://github.com/php/php-src.git `
+            $env:PHP_SOURCE
+
+          if (-not (
+            Test-Path "$env:PHP_SOURCE\buildconf.bat"
+          )) {
+            throw "No se descargó correctamente PHP."
+          }
+
+          git -C $env:PHP_SOURCE describe --tags --always
+
+      - name: Descargar SQLCipher
+        shell: pwsh
+        run: |
+          if (Test-Path $env:SQLCIPHER_SOURCE) {
+            Remove-Item `
+              $env:SQLCIPHER_SOURCE `
+              -Recurse `
+              -Force
+          }
+
+          git clone `
+            --depth 1 `
+            --branch "v$env:SQLCIPHER_VERSION" `
+            https://github.com/sqlcipher/sqlcipher.git `
+            $env:SQLCIPHER_SOURCE
+
+          if (-not (
+            Test-Path "$env:SQLCIPHER_SOURCE\Makefile.msc"
+          )) {
+            throw "No se descargó correctamente SQLCipher."
+          }
+
+          git -C $env:SQLCIPHER_SOURCE describe --tags --always
+
+      # ----------------------------------------------------------------------
+      # DEPENDENCIAS PHP
+      # ----------------------------------------------------------------------
+
+      - name: Descargar dependencias oficiales de PHP
+        shell: pwsh
+        run: |
+          $versionParts = $env:PHP_VERSION.Split(".")
+
+          if ($versionParts.Count -lt 2) {
+            throw "PHP_VERSION no es válido."
+          }
+
+          $phpBranch = "$($versionParts[0]).$($versionParts[1])"
+
+          Write-Host "Rama de dependencias: $phpBranch"
+
+          $task = @"
+          @echo off
+          setlocal
+
+          cd /d "%PHP_SOURCE%"
+
+          call phpsdk_deps --update --branch $phpBranch
+
+          if errorlevel 1 exit /b %errorlevel%
+
+          exit /b 0
+          "@
+
+          $taskPath = "C:\build\download-deps.cmd"
+
+          Set-Content `
+            -Path $taskPath `
+            -Value $task `
+            -Encoding ascii
+
+          & cmd.exe /d /s /c `
+            "`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló phpsdk_deps."
+          }
+
+      - name: Verificar directorio deps
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:PHP_DEPS)) {
+            throw "No existe PHP_DEPS: $env:PHP_DEPS"
+          }
+
+          foreach ($directory in @(
+            "$env:PHP_DEPS\include",
+            "$env:PHP_DEPS\lib",
+            "$env:PHP_DEPS\bin"
+          )) {
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              -Path $directory |
+              Out-Null
+          }
+
+          Write-Host "Dependencias PHP:"
+
+          Get-ChildItem `
+            -Path $env:PHP_DEPS `
+            -Directory |
+            Select-Object FullName
+
+      - name: Localizar OpenSSL
+        shell: pwsh
+        run: |
+          $header = Get-ChildItem `
+            -Path $env:PHP_DEPS `
+            -Filter "evp.h" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FullName -match "[\\/]openssl[\\/]evp\.h$"
+            } |
+            Select-Object -First 1
+
+          if (-not $header) {
+            throw "No se encontró openssl\evp.h."
+          }
+
+          $opensslInclude = Split-Path `
+            (Split-Path $header.FullName -Parent) `
+            -Parent
+
+          $libcrypto = Get-ChildItem `
+            -Path $env:PHP_DEPS `
+            -Filter "libcrypto.lib" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $libcrypto) {
+            throw "No se encontró libcrypto.lib."
+          }
+
+          $opensslLib = $libcrypto.Directory.FullName
+
           "OPENSSL_INCLUDE=$opensslInclude" >> $env:GITHUB_ENV
           "OPENSSL_LIB=$opensslLib" >> $env:GITHUB_ENV
 
-          Write-Host "PHP_DEPS: $phpDeps"
-          Write-Host "OPENSSL_INCLUDE: $opensslInclude"
-          Write-Host "OPENSSL_LIB: $opensslLib"
+          Write-Host "OPENSSL_INCLUDE=$opensslInclude"
+          Write-Host "OPENSSL_LIB=$opensslLib"
+
+          Get-Item `
+            $header.FullName, `
+            $libcrypto.FullName |
+            Select-Object FullName, Length
+
+      # ----------------------------------------------------------------------
+      # COMPILACIÓN SQLCIPHER
+      # ----------------------------------------------------------------------
 
       - name: Generar amalgamación SQLCipher
         shell: pwsh
         run: |
           $task = @'
           @echo off
+          setlocal
+
           cd /d "%SQLCIPHER_SOURCE%"
 
-          nmake /f Makefile.msc sqlite3.c
+          del /q sqlite3.c 2>nul
+          del /q sqlite3.h 2>nul
+          del /q sqlite3ext.h 2>nul
+
+          nmake /f Makefile.msc sqlite3.c ^
+            NO_TCL=1 ^
+            USE_CRT_DLL=1
 
           if errorlevel 1 exit /b %errorlevel%
+
+          if not exist sqlite3.c exit /b 1
+          if not exist sqlite3.h exit /b 1
+          if not exist sqlite3ext.h exit /b 1
+
+          exit /b 0
           '@
 
-          $taskPath = Join-Path `
-            $env:BUILD_ROOT `
-            "sqlcipher-amalgamation-task.cmd"
+          $taskPath = "C:\build\generate-sqlcipher.cmd"
 
           Set-Content `
             -Path $taskPath `
@@ -204,27 +400,44 @@ jobs:
             throw "Falló la generación de la amalgamación SQLCipher."
           }
 
-          foreach ($file in @(
-            "sqlite3.c",
-            "sqlite3.h",
-            "sqlite3ext.h"
+          foreach ($required in @(
+            "$env:SQLCIPHER_SOURCE\sqlite3.c",
+            "$env:SQLCIPHER_SOURCE\sqlite3.h",
+            "$env:SQLCIPHER_SOURCE\sqlite3ext.h"
           )) {
-            $path = Join-Path $env:SQLCIPHER_SOURCE $file
-
-            if (-not (Test-Path $path)) {
-              throw "SQLCipher no generó: $path"
+            if (-not (Test-Path $required)) {
+              throw "Archivo SQLCipher faltante: $required"
             }
+
+            Get-Item $required |
+              Select-Object FullName, Length
           }
 
-      - name: Compilar SQLCipher como sqlite3.lib
+      - name: Compilar SQLCipher DLL
         shell: pwsh
         run: |
           $task = @'
           @echo off
+          setlocal
+
           cd /d "%SQLCIPHER_SOURCE%"
 
-          cl /nologo /c /O2 /MD ^
+          del /q sqlite3.obj 2>nul
+          del /q sqlite3.dll 2>nul
+          del /q sqlite3.lib 2>nul
+          del /q sqlite3.exp 2>nul
+          del /q sqlite3.pdb 2>nul
+
+          cl.exe ^
+            /nologo ^
+            /O2 ^
+            /MD ^
+            /LD ^
+            /D_CRT_SECURE_NO_WARNINGS=1 ^
+            /DHAVE_STDINT_H=1 ^
             /DSQLITE_HAS_CODEC=1 ^
+            /DSQLITE_EXTRA_INIT=sqlcipher_extra_init ^
+            /DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown ^
             /DSQLCIPHER_CRYPTO_OPENSSL=1 ^
             /DSQLITE_TEMP_STORE=2 ^
             /DSQLITE_THREADSAFE=1 ^
@@ -234,22 +447,31 @@ jobs:
             /DSQLITE_ENABLE_FTS5=1 ^
             /DSQLITE_ENABLE_RTREE=1 ^
             /DSQLITE_ENABLE_UNLOCK_NOTIFY=1 ^
+            /DSQLITE_ENABLE_MATH_FUNCTIONS=1 ^
+            /DSQLITE_API=__declspec(dllexport) ^
             /I"%OPENSSL_INCLUDE%" ^
             sqlite3.c ^
-            /Fosqlite3.obj
+            /link ^
+            /OUT:sqlite3.dll ^
+            /IMPLIB:sqlite3.lib ^
+            /LIBPATH:"%OPENSSL_LIB%" ^
+            libcrypto.lib ^
+            libssl.lib ^
+            crypt32.lib ^
+            bcrypt.lib ^
+            advapi32.lib ^
+            user32.lib ^
+            ws2_32.lib
 
           if errorlevel 1 exit /b %errorlevel%
 
-          lib /nologo ^
-            /OUT:sqlite3.lib ^
-            sqlite3.obj
+          if not exist sqlite3.dll exit /b 1
+          if not exist sqlite3.lib exit /b 1
 
-          if errorlevel 1 exit /b %errorlevel%
+          exit /b 0
           '@
 
-          $taskPath = Join-Path `
-            $env:BUILD_ROOT `
-            "sqlcipher-library-task.cmd"
+          $taskPath = "C:\build\compile-sqlcipher.cmd"
 
           Set-Content `
             -Path $taskPath `
@@ -263,60 +485,88 @@ jobs:
             throw "Falló la compilación de SQLCipher."
           }
 
-          if (-not (
-            Test-Path "$env:SQLCIPHER_SOURCE\sqlite3.lib"
+          foreach ($required in @(
+            "$env:SQLCIPHER_SOURCE\sqlite3.dll",
+            "$env:SQLCIPHER_SOURCE\sqlite3.lib"
           )) {
-            throw "No se generó sqlite3.lib."
+            if (-not (Test-Path $required)) {
+              throw "SQLCipher no generó: $required"
+            }
+
+            Get-Item $required |
+              Select-Object FullName, Length
           }
 
-      - name: Reemplazar SQLite de PHP por SQLCipher
+      - name: Instalar SQLCipher en deps de PHP
         shell: pwsh
         run: |
-          $includeDir = Join-Path $env:PHP_DEPS "include"
-          $libDir = Join-Path $env:PHP_DEPS "lib"
+          $includeDirectory = Join-Path `
+            $env:PHP_DEPS `
+            "include"
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $includeDir, $libDir |
-            Out-Null
+          $libDirectory = Join-Path `
+            $env:PHP_DEPS `
+            "lib"
+
+          $binDirectory = Join-Path `
+            $env:PHP_DEPS `
+            "bin"
 
           Copy-Item `
             "$env:SQLCIPHER_SOURCE\sqlite3.h" `
-            "$includeDir\sqlite3.h" `
+            "$includeDirectory\sqlite3.h" `
             -Force
 
           Copy-Item `
             "$env:SQLCIPHER_SOURCE\sqlite3ext.h" `
-            "$includeDir\sqlite3ext.h" `
+            "$includeDirectory\sqlite3ext.h" `
             -Force
 
           Copy-Item `
             "$env:SQLCIPHER_SOURCE\sqlite3.lib" `
-            "$libDir\sqlite3.lib" `
+            "$libDirectory\sqlite3.lib" `
             -Force
 
-          Get-Item `
-            "$includeDir\sqlite3.h", `
-            "$includeDir\sqlite3ext.h", `
-            "$libDir\sqlite3.lib" |
-            Select-Object FullName, Length, LastWriteTime
+          Copy-Item `
+            "$env:SQLCIPHER_SOURCE\sqlite3.dll" `
+            "$binDirectory\sqlite3.dll" `
+            -Force
+
+          foreach ($required in @(
+            "$includeDirectory\sqlite3.h",
+            "$includeDirectory\sqlite3ext.h",
+            "$libDirectory\sqlite3.lib",
+            "$binDirectory\sqlite3.dll"
+          )) {
+            if (-not (Test-Path $required)) {
+              throw "No se instaló correctamente: $required"
+            }
+
+            Get-Item $required |
+              Select-Object FullName, Length, LastWriteTime
+          }
+
+      # ----------------------------------------------------------------------
+      # COMPILACIÓN PHP
+      # ----------------------------------------------------------------------
 
       - name: Ejecutar buildconf
         shell: pwsh
         run: |
           $task = @'
           @echo off
+          setlocal
+
           cd /d "%PHP_SOURCE%"
 
           call buildconf.bat --force
 
           if errorlevel 1 exit /b %errorlevel%
+
+          exit /b 0
           '@
 
-          $taskPath = Join-Path `
-            $env:BUILD_ROOT `
-            "buildconf-task.cmd"
+          $taskPath = "C:\build\php-buildconf.cmd"
 
           Set-Content `
             -Path $taskPath `
@@ -327,53 +577,54 @@ jobs:
             "`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Falló buildconf con código $LASTEXITCODE"
+            throw "Falló buildconf."
           }
 
-      - name: Configurar PHP
+          if (-not (
+            Test-Path "$env:PHP_SOURCE\configure.bat"
+          )) {
+            throw "No se generó configure.bat."
+          }
+
+      - name: Configurar PHP con PDO SQLite y SQLCipher
         shell: pwsh
         run: |
           $task = @'
           @echo off
+          setlocal
+
           cd /d "%PHP_SOURCE%"
 
-          call configure ^
+          call configure.bat ^
             --disable-all ^
             --disable-zts ^
             --enable-cli ^
             --enable-cgi ^
             --enable-pdo ^
-            --enable-session ^
+            --enable-ctype ^
             --enable-filter ^
+            --enable-session ^
             --enable-tokenizer ^
             --enable-mbstring ^
-            --enable-opcache ^
-            --enable-phar ^
-            --enable-ctype ^
             --enable-fileinfo ^
             --enable-sockets ^
-            --enable-calendar ^
-            --enable-exif ^
-            --enable-ftp ^
-            --enable-shmop ^
-            --enable-sysvshm ^
-            --enable-sysvsem ^
-            --enable-sysvmsg ^
+            --enable-phar ^
+            --enable-opcache ^
             --with-openssl ^
             --with-curl ^
             --with-zlib ^
             --with-zip ^
             --with-iconv ^
-            --with-sqlite3 ^
-            --with-pdo-sqlite ^
-            --with-prefix="%OUTPUT_DIRECTORY%"
+            --with-sqlite3=shared ^
+            --with-pdo-sqlite=shared ^
+            --with-php-build="%PHP_DEPS%"
 
           if errorlevel 1 exit /b %errorlevel%
+
+          exit /b 0
           '@
 
-          $taskPath = Join-Path `
-            $env:BUILD_ROOT `
-            "configure-task.cmd"
+          $taskPath = "C:\build\php-configure.cmd"
 
           Set-Content `
             -Path $taskPath `
@@ -384,7 +635,15 @@ jobs:
             "`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Falló configure con código $LASTEXITCODE"
+            if (Test-Path "$env:PHP_SOURCE\config.log") {
+              Write-Host "Contenido final de config.log:"
+
+              Get-Content `
+                "$env:PHP_SOURCE\config.log" `
+                -Tail 300
+            }
+
+            throw "Falló configure."
           }
 
       - name: Verificar configuración SQLite
@@ -393,61 +652,68 @@ jobs:
           $makefilePath = "$env:PHP_SOURCE\Makefile"
 
           if (-not (Test-Path $makefilePath)) {
-            throw "No se generó el Makefile."
+            throw "No se generó el Makefile de PHP."
           }
 
-          $makefile = Get-Content `
-            $makefilePath `
-            -Raw
-
-          if ($makefile -notmatch "pdo_sqlite") {
-            throw "La configuración no incluyó pdo_sqlite."
-          }
-
-          if ($makefile -notmatch "sqlite3") {
-            throw "La configuración no incluyó sqlite3."
-          }
-
-          Write-Host "SQLite y PDO SQLite fueron incluidos."
-
-      - name: Agregar bibliotecas OpenSSL al enlazador
-        shell: pwsh
-        run: |
-          $makefilePath = "$env:PHP_SOURCE\Makefile"
-          $makefileText = Get-Content $makefilePath -Raw
-
-          $makefileText = $makefileText -replace `
-            "(?m)^LIBS=(.*)$", `
-            'LIBS=$1 libcrypto.lib libssl.lib crypt32.lib bcrypt.lib advapi32.lib user32.lib ws2_32.lib'
-
-          $makefileText = $makefileText -replace `
-            "(?m)^LDFLAGS=(.*)$", `
-            ('LDFLAGS=$1 /LIBPATH:"' + $env:OPENSSL_LIB + '"')
-
-          Set-Content `
-            -Path $makefilePath `
-            -Value $makefileText `
-            -Encoding ascii
+          Write-Host "Referencias a SQLite en Makefile:"
 
           Select-String `
             -Path $makefilePath `
-            -Pattern "^LIBS=", "^LDFLAGS="
+            -Pattern `
+              "pdo_sqlite", `
+              "php_pdo_sqlite", `
+              "php_sqlite3", `
+              "sqlite3.lib" |
+            Select-Object -First 100
+
+          $makefileContent = Get-Content `
+            $makefilePath `
+            -Raw
+
+          if (
+            $makefileContent -notmatch
+            "php_pdo_sqlite"
+          ) {
+            if (Test-Path "$env:PHP_SOURCE\config.log") {
+              Select-String `
+                -Path "$env:PHP_SOURCE\config.log" `
+                -Pattern `
+                  "pdo_sqlite", `
+                  "sqlite3", `
+                  "not found", `
+                  "not enabled" `
+                -Context 3, 3
+            }
+
+            throw "pdo_sqlite no quedó configurado como extensión."
+          }
+
+          if (
+            $makefileContent -notmatch
+            "php_sqlite3"
+          ) {
+            throw "sqlite3 no quedó configurado como extensión."
+          }
+
+          Write-Host "PDO SQLite y SQLite3 quedaron configurados."
 
       - name: Compilar PHP
         shell: pwsh
         run: |
           $task = @'
           @echo off
+          setlocal
+
           cd /d "%PHP_SOURCE%"
 
           nmake
 
           if errorlevel 1 exit /b %errorlevel%
+
+          exit /b 0
           '@
 
-          $taskPath = Join-Path `
-            $env:BUILD_ROOT `
-            "nmake-task.cmd"
+          $taskPath = "C:\build\php-nmake.cmd"
 
           Set-Content `
             -Path $taskPath `
@@ -458,77 +724,152 @@ jobs:
             "`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Falló nmake con código $LASTEXITCODE"
+            throw "Falló la compilación de PHP."
           }
+
+      - name: Generar paquete oficial PHP
+        shell: pwsh
+        run: |
+          $task = @'
+          @echo off
+          setlocal
+
+          cd /d "%PHP_SOURCE%"
+
+          nmake snap
+
+          if errorlevel 1 exit /b %errorlevel%
+
+          exit /b 0
+          '@
+
+          $taskPath = "C:\build\php-snap.cmd"
+
+          Set-Content `
+            -Path $taskPath `
+            -Value $task `
+            -Encoding ascii
+
+          & cmd.exe /d /s /c `
+            "`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló nmake snap."
+          }
+
+      # ----------------------------------------------------------------------
+      # PREPARACIÓN DEL PAQUETE
+      # ----------------------------------------------------------------------
 
       - name: Localizar PHP compilado
         shell: pwsh
         run: |
-          $phpExe = Get-ChildItem `
+          $phpExecutable = Get-ChildItem `
             -Path $env:PHP_SOURCE `
-            -Filter php.exe `
+            -Filter "php.exe" `
             -Recurse `
             -ErrorAction SilentlyContinue |
             Where-Object {
-              $_.FullName -match "Release"
+              $_.Directory.Name -eq "Release"
             } |
             Select-Object -First 1
 
-          if (-not $phpExe) {
-            throw "No se encontró php.exe compilado."
+          if (-not $phpExecutable) {
+            throw "No se encontró php.exe en Release."
           }
 
-          $phpBuildDirectory = $phpExe.Directory.FullName
+          $releaseDirectory = $phpExecutable.Directory.FullName
 
-          "PHP_BUILD_DIRECTORY=$phpBuildDirectory" >> $env:GITHUB_ENV
-          "PHP_EXE=$($phpExe.FullName)" >> $env:GITHUB_ENV
+          "PHP_RELEASE=$releaseDirectory" >> $env:GITHUB_ENV
 
-          Write-Host "PHP encontrado en:"
-          Write-Host $phpExe.FullName
+          Write-Host "PHP_RELEASE=$releaseDirectory"
 
-      - name: Preparar distribución PHP
+          Get-ChildItem `
+            -Path $releaseDirectory |
+            Sort-Object Name |
+            Select-Object Name, Length
+
+      - name: Verificar extensiones compiladas
         shell: pwsh
         run: |
-          Remove-Item `
-            "$env:OUTPUT_DIRECTORY\*" `
+          $pdoSqliteDll = Get-ChildItem `
+            -Path $env:PHP_SOURCE `
+            -Filter "php_pdo_sqlite.dll" `
             -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          $sqlite3Dll = Get-ChildItem `
+            -Path $env:PHP_SOURCE `
+            -Filter "php_sqlite3.dll" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $pdoSqliteDll) {
+            throw "No se generó php_pdo_sqlite.dll."
+          }
+
+          if (-not $sqlite3Dll) {
+            throw "No se generó php_sqlite3.dll."
+          }
+
+          "PDO_SQLITE_DLL=$($pdoSqliteDll.FullName)" >>
+            $env:GITHUB_ENV
+
+          "PHP_SQLITE3_DLL=$($sqlite3Dll.FullName)" >>
+            $env:GITHUB_ENV
+
+          Get-Item `
+            $pdoSqliteDll.FullName, `
+            $sqlite3Dll.FullName |
+            Select-Object FullName, Length
+
+      - name: Preparar directorio de salida
+        shell: pwsh
+        run: |
+          if (Test-Path $env:OUTPUT_DIRECTORY) {
+            Remove-Item `
+              $env:OUTPUT_DIRECTORY `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
             -Force `
-            -ErrorAction SilentlyContinue
+            -Path `
+              $env:OUTPUT_DIRECTORY, `
+              "$env:OUTPUT_DIRECTORY\ext" |
+            Out-Null
 
           Copy-Item `
-            -Path "$env:PHP_BUILD_DIRECTORY\*" `
+            -Path "$env:PHP_RELEASE\*" `
             -Destination $env:OUTPUT_DIRECTORY `
             -Recurse `
             -Force
 
-          $phpDlls = Get-ChildItem `
-            -Path $env:PHP_SOURCE `
-            -Filter "*.dll" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.FullName -match "Release"
-            }
+          Copy-Item `
+            $env:PDO_SQLITE_DLL `
+            "$env:OUTPUT_DIRECTORY\ext\php_pdo_sqlite.dll" `
+            -Force
 
-          foreach ($dll in $phpDlls) {
-            $destination = Join-Path `
-              $env:OUTPUT_DIRECTORY `
-              $dll.Name
+          Copy-Item `
+            $env:PHP_SQLITE3_DLL `
+            "$env:OUTPUT_DIRECTORY\ext\php_sqlite3.dll" `
+            -Force
 
-            if (-not (Test-Path $destination)) {
-              Copy-Item `
-                $dll.FullName `
-                $destination `
-                -Force
-            }
-          }
+          Copy-Item `
+            "$env:SQLCIPHER_SOURCE\sqlite3.dll" `
+            "$env:OUTPUT_DIRECTORY\sqlite3.dll" `
+            -Force
 
       - name: Copiar DLL de dependencias
         shell: pwsh
         run: |
           $dependencyDirectories = @(
-            (Join-Path $env:PHP_DEPS "bin"),
-            (Join-Path $env:PHP_DEPS "lib")
+            "$env:PHP_DEPS\bin",
+            "$env:PHP_DEPS\lib"
           )
 
           foreach ($directory in $dependencyDirectories) {
@@ -539,56 +880,94 @@ jobs:
             Get-ChildItem `
               -Path $directory `
               -Filter "*.dll" `
+              -File `
               -ErrorAction SilentlyContinue |
               ForEach-Object {
+                $destination = Join-Path `
+                  $env:OUTPUT_DIRECTORY `
+                  $_.Name
+
                 Copy-Item `
                   $_.FullName `
-                  $env:OUTPUT_DIRECTORY `
+                  $destination `
                   -Force
               }
           }
 
+          # SQLCipher debe prevalecer sobre sqlite3.dll oficial.
+          Copy-Item `
+            "$env:SQLCIPHER_SOURCE\sqlite3.dll" `
+            "$env:OUTPUT_DIRECTORY\sqlite3.dll" `
+            -Force
+
       - name: Crear php.ini
         shell: pwsh
         run: |
-          @"
+          $phpIni = @'
           [PHP]
+
           extension_dir="ext"
+
+          extension=php_pdo_sqlite.dll
+          extension=php_sqlite3.dll
+
+          display_errors=On
+          display_startup_errors=On
+          error_reporting=E_ALL
+
           date.timezone=America/Santiago
           memory_limit=512M
           max_execution_time=0
           variables_order=GPCS
-          display_errors=On
-          display_startup_errors=On
-          error_reporting=E_ALL
-          "@ | Set-Content `
+          '@
+
+          Set-Content `
             -Path "$env:OUTPUT_DIRECTORY\php.ini" `
+            -Value $phpIni `
             -Encoding ascii
 
-      - name: Verificar archivos de PHP
+          Get-Content "$env:OUTPUT_DIRECTORY\php.ini"
+
+      # ----------------------------------------------------------------------
+      # VALIDACIONES
+      # ----------------------------------------------------------------------
+
+      - name: Verificar archivos requeridos
         shell: pwsh
         run: |
-          Get-ChildItem `
-            $env:OUTPUT_DIRECTORY |
-            Sort-Object Name |
-            Select-Object Name, Length
+          $requiredFiles = @(
+            "$env:OUTPUT_DIRECTORY\php.exe",
+            "$env:OUTPUT_DIRECTORY\php.ini",
+            "$env:OUTPUT_DIRECTORY\sqlite3.dll",
+            "$env:OUTPUT_DIRECTORY\ext\php_pdo_sqlite.dll",
+            "$env:OUTPUT_DIRECTORY\ext\php_sqlite3.dll"
+          )
 
-          if (-not (
-            Test-Path "$env:OUTPUT_DIRECTORY\php.exe"
-          )) {
-            throw "php.exe no se encuentra en output."
+          foreach ($required in $requiredFiles) {
+            if (-not (Test-Path $required)) {
+              throw "Archivo requerido ausente: $required"
+            }
+
+            Get-Item $required |
+              Select-Object FullName, Length
           }
 
-      - name: Probar PHP
+      - name: Mostrar información de PHP
         shell: pwsh
         run: |
-          & "$env:OUTPUT_DIRECTORY\php.exe" `
+          $php = "$env:OUTPUT_DIRECTORY\php.exe"
+          $phpIni = "$env:OUTPUT_DIRECTORY\php.ini"
+
+          & $php `
+            -c $phpIni `
             --ini
 
-          & "$env:OUTPUT_DIRECTORY\php.exe" `
+          & $php `
+            -c $phpIni `
             -v
 
-          & "$env:OUTPUT_DIRECTORY\php.exe" `
+          & $php `
+            -c $phpIni `
             -m
 
           if ($LASTEXITCODE -ne 0) {
@@ -603,17 +982,24 @@ jobs:
 
           declare(strict_types=1);
 
-          echo "PHP: ".PHP_VERSION.PHP_EOL;
-          echo "Extensiones:".PHP_EOL;
+          echo 'PHP: '.PHP_VERSION.PHP_EOL;
 
-          foreach (get_loaded_extensions() as $extension) {
-              echo "- {$extension}".PHP_EOL;
-          }
+          echo 'PDO disponible: '
+              .(class_exists(PDO::class) ? 'sí' : 'no')
+              .PHP_EOL;
+
+          echo 'pdo_sqlite cargado: '
+              .(extension_loaded('pdo_sqlite') ? 'sí' : 'no')
+              .PHP_EOL;
+
+          echo 'sqlite3 cargado: '
+              .(extension_loaded('sqlite3') ? 'sí' : 'no')
+              .PHP_EOL;
 
           if (!class_exists(PDO::class)) {
               fwrite(
                   STDERR,
-                  "PDO no está disponible.".PHP_EOL
+                  "ERROR: PDO no está disponible.\n"
               );
 
               exit(1);
@@ -621,25 +1007,41 @@ jobs:
 
           $drivers = PDO::getAvailableDrivers();
 
-          echo "PDO drivers: "
+          echo 'Drivers PDO: '
               .implode(', ', $drivers)
               .PHP_EOL;
 
-          if (!in_array('sqlite', $drivers, true)) {
+          if (!extension_loaded('pdo_sqlite')) {
               fwrite(
                   STDERR,
-                  "pdo_sqlite no está disponible.".PHP_EOL
+                  "ERROR: pdo_sqlite no está cargado.\n"
               );
 
               exit(1);
           }
 
-          echo "pdo_sqlite está disponible.".PHP_EOL;
+          if (!extension_loaded('sqlite3')) {
+              fwrite(
+                  STDERR,
+                  "ERROR: sqlite3 no está cargado.\n"
+              );
+
+              exit(1);
+          }
+
+          if (!in_array('sqlite', $drivers, true)) {
+              fwrite(
+                  STDERR,
+                  "ERROR: PDO no tiene el driver sqlite.\n"
+              );
+
+              exit(1);
+          }
+
+          echo "PDO SQLite está disponible.\n";
           '@
 
-          $scriptPath = Join-Path `
-            $env:BUILD_ROOT `
-            "test-pdo-sqlite.php"
+          $scriptPath = "C:\build\test-pdo-sqlite.php"
 
           Set-Content `
             -Path $scriptPath `
@@ -647,13 +1049,82 @@ jobs:
             -Encoding utf8
 
           & "$env:OUTPUT_DIRECTORY\php.exe" `
+            -c "$env:OUTPUT_DIRECTORY\php.ini" `
             $scriptPath
 
           if ($LASTEXITCODE -ne 0) {
-            throw "La validación de PDO SQLite falló."
+            throw "La validación PDO SQLite falló."
           }
 
-      - name: Probar SQLCipher
+      - name: Verificar versión SQLCipher
+        shell: pwsh
+        run: |
+          $script = @'
+          <?php
+
+          declare(strict_types=1);
+
+          if (
+              !in_array(
+                  'sqlite',
+                  PDO::getAvailableDrivers(),
+                  true
+              )
+          ) {
+              fwrite(
+                  STDERR,
+                  "ERROR: PDO SQLite no está disponible.\n"
+              );
+
+              exit(1);
+          }
+
+          $pdo = new PDO(
+              'sqlite::memory:',
+              null,
+              null,
+              [
+                  PDO::ATTR_ERRMODE =>
+                      PDO::ERRMODE_EXCEPTION,
+              ]
+          );
+
+          $version = $pdo
+              ->query('PRAGMA cipher_version;')
+              ->fetchColumn();
+
+          if (
+              !is_string($version) ||
+              trim($version) === ''
+          ) {
+              fwrite(
+                  STDERR,
+                  "ERROR: PRAGMA cipher_version "
+                  ."no devolvió una versión.\n"
+              );
+
+              exit(1);
+          }
+
+          echo "SQLCipher: {$version}\n";
+          '@
+
+          $scriptPath = "C:\build\test-cipher-version.php"
+
+          Set-Content `
+            -Path $scriptPath `
+            -Value $script `
+            -Encoding utf8
+
+          & "$env:OUTPUT_DIRECTORY\php.exe" `
+            -c "$env:OUTPUT_DIRECTORY\php.ini" `
+            $scriptPath
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "PHP está usando SQLite normal y no SQLCipher."
+          }
+
+      - name: Probar base de datos cifrada
         shell: pwsh
         run: |
           $script = @'
@@ -671,55 +1142,9 @@ jobs:
               exit(1);
           }
 
-          if (!extension_loaded('PDO')) {
-              fail('PDO no está disponible.');
-          }
-
-          if (
-              !in_array(
-                  'sqlite',
-                  PDO::getAvailableDrivers(),
-                  true
-              )
-          ) {
-              fail(
-                  'pdo_sqlite no está disponible. Drivers: '
-                  .implode(
-                      ', ',
-                      PDO::getAvailableDrivers()
-                  )
-              );
-          }
-
-          $memoryDatabase = new PDO(
-              'sqlite::memory:',
-              null,
-              null,
-              [
-                  PDO::ATTR_ERRMODE =>
-                      PDO::ERRMODE_EXCEPTION,
-              ]
-          );
-
-          $version = $memoryDatabase
-              ->query('PRAGMA cipher_version;')
-              ->fetchColumn();
-
-          if (
-              !is_string($version) ||
-              trim($version) === ''
-          ) {
-              fail(
-                  'PRAGMA cipher_version no devolvió '
-                  .'una versión válida.'
-              );
-          }
-
-          echo "SQLCipher: {$version}".PHP_EOL;
-
           $databasePath = sys_get_temp_dir()
               .DIRECTORY_SEPARATOR
-              .'prueba-sqlcipher.sqlite';
+              .'sqlcipher-github-test.sqlite';
 
           @unlink($databasePath);
 
@@ -734,8 +1159,19 @@ jobs:
           );
 
           $database->exec(
-              "PRAGMA key = 'clave-prueba-github';"
+              "PRAGMA key = 'clave-prueba-github-actions';"
           );
+
+          $cipherVersion = $database
+              ->query('PRAGMA cipher_version;')
+              ->fetchColumn();
+
+          if (
+              !is_string($cipherVersion) ||
+              trim($cipherVersion) === ''
+          ) {
+              fail('SQLCipher no está activo.');
+          }
 
           $database->exec(
               'CREATE TABLE prueba (
@@ -750,7 +1186,7 @@ jobs:
           );
 
           $statement->execute([
-              'valor' => 'correcto',
+              'valor' => 'contenido cifrado correcto',
           ]);
 
           unset(
@@ -769,7 +1205,7 @@ jobs:
           if ($header === false) {
               fail(
                   'No fue posible leer el encabezado '
-                  .'de la base.'
+                  .'del archivo.'
               );
           }
 
@@ -780,8 +1216,8 @@ jobs:
               )
           ) {
               fail(
-                  'La base conserva el encabezado '
-                  .'SQLite convencional y no está cifrada.'
+                  'La base mantiene el encabezado '
+                  .'SQLite sin cifrar.'
               );
           }
 
@@ -796,7 +1232,7 @@ jobs:
           );
 
           $database->exec(
-              "PRAGMA key = 'clave-prueba-github';"
+              "PRAGMA key = 'clave-prueba-github-actions';"
           );
 
           $value = $database
@@ -807,22 +1243,60 @@ jobs:
               )
               ->fetchColumn();
 
-          if ($value !== 'correcto') {
+          if ($value !== 'contenido cifrado correcto') {
               fail(
-                  'No fue posible recuperar '
-                  .'el contenido cifrado.'
+                  'No fue posible leer el contenido '
+                  .'utilizando la clave correcta.'
               );
           }
 
-          echo "Prueba SQLCipher completada."
-              .PHP_EOL;
+          unset($database);
+
+          $wrongKeyFailed = false;
+
+          try {
+              $wrongDatabase = new PDO(
+                  'sqlite:'.$databasePath,
+                  null,
+                  null,
+                  [
+                      PDO::ATTR_ERRMODE =>
+                          PDO::ERRMODE_EXCEPTION,
+                  ]
+              );
+
+              $wrongDatabase->exec(
+                  "PRAGMA key = 'clave-incorrecta';"
+              );
+
+              $wrongDatabase
+                  ->query(
+                      'SELECT valor
+                       FROM prueba
+                       LIMIT 1;'
+                  )
+                  ->fetchColumn();
+          } catch (Throwable) {
+              $wrongKeyFailed = true;
+          }
+
+          if (!$wrongKeyFailed) {
+              fail(
+                  'La base pudo abrirse utilizando '
+                  .'una clave incorrecta.'
+              );
+          }
+
+          echo "SQLCipher: {$cipherVersion}".PHP_EOL;
+          echo "Encabezado cifrado verificado.".PHP_EOL;
+          echo "Lectura con clave correcta verificada.".PHP_EOL;
+          echo "Rechazo de clave incorrecta verificado.".PHP_EOL;
+          echo "Prueba SQLCipher completada.".PHP_EOL;
 
           @unlink($databasePath);
           '@
 
-          $scriptPath = Join-Path `
-            $env:BUILD_ROOT `
-            "test-sqlcipher.php"
+          $scriptPath = "C:\build\test-encrypted-database.php"
 
           Set-Content `
             -Path $scriptPath `
@@ -830,42 +1304,72 @@ jobs:
             -Encoding utf8
 
           & "$env:OUTPUT_DIRECTORY\php.exe" `
+            -c "$env:OUTPUT_DIRECTORY\php.ini" `
             $scriptPath
 
           if ($LASTEXITCODE -ne 0) {
-            throw "La validación SQLCipher falló."
+            throw "La prueba de cifrado SQLCipher falló."
           }
+
+      # ----------------------------------------------------------------------
+      # CREACIÓN Y PUBLICACIÓN DEL ARTEFACTO
+      # ----------------------------------------------------------------------
 
       - name: Crear información del build
         shell: pwsh
         run: |
-          @"
-          PHP compilado con SQLCipher
-          ============================
+          $buildInfo = @"
+          PHP con SQLCipher para Windows
+          =================================
 
           PHP: $env:PHP_VERSION
           SQLCipher: $env:SQLCIPHER_VERSION
-          Plataforma: Windows x64
+          Arquitectura: x64
           Thread Safety: NTS
+          Compilador: Visual Studio 2022
+          Extensiones SQLite: compartidas
 
-          Verificación realizada:
-          - PHP CLI funcional
-          - PDO disponible
-          - PDO SQLite disponible
+          Validaciones realizadas:
+          - php.exe ejecutable
+          - PDO cargado
+          - pdo_sqlite cargado
+          - sqlite3 cargado
+          - Driver PDO sqlite disponible
           - PRAGMA cipher_version funcional
-          - Base de datos cifrada
+          - Archivo sin encabezado SQLite convencional
           - Lectura con clave correcta
-          "@ | Set-Content `
+          - Rechazo de clave incorrecta
+          "@
+
+          Set-Content `
             -Path "$env:OUTPUT_DIRECTORY\BUILD-INFO.txt" `
+            -Value $buildInfo `
             -Encoding utf8
 
-      - name: Crear ZIP para NativePHP
+      - name: Crear paquete ZIP
         shell: pwsh
         run: |
-          $zipName = "php-$env:PHP_VERSION-windows-x64-sqlcipher.zip"
+          if (Test-Path $env:PACKAGE_DIRECTORY) {
+            Remove-Item `
+              $env:PACKAGE_DIRECTORY `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $env:PACKAGE_DIRECTORY |
+            Out-Null
+
+          $zipName = (
+            "php-{0}-nts-Windows-x64-sqlcipher-{1}.zip" -f
+            $env:PHP_VERSION,
+            $env:SQLCIPHER_VERSION
+          )
 
           $zipPath = Join-Path `
-            $env:BUILD_ROOT `
+            $env:PACKAGE_DIRECTORY `
             $zipName
 
           Compress-Archive `
@@ -873,6 +1377,10 @@ jobs:
             -DestinationPath $zipPath `
             -CompressionLevel Optimal `
             -Force
+
+          if (-not (Test-Path $zipPath)) {
+            throw "No se generó el archivo ZIP."
+          }
 
           "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
           "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
@@ -883,7 +1391,7 @@ jobs:
       - name: Publicar artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: php-${{ inputs.php_version }}-windows-x64-sqlcipher
+          name: php-${{ inputs.php_version }}-windows-x64-sqlcipher-${{ inputs.sqlcipher_version }}
           path: ${{ env.ZIP_PATH }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
