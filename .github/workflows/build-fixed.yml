@@ -1,0 +1,285 @@
+name: Build PHP SQLCipher Fixed
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-fixed.yml"
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: PHP version
+        required: true
+        default: "8.5.7"
+      sqlcipher_version:
+        description: SQLCipher version
+        required: true
+        default: "4.16.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    env:
+      PHP_VERSION: ${{ inputs.php_version || '8.5.7' }}
+      SQLCIPHER_VERSION: ${{ inputs.sqlcipher_version || '4.16.0' }}
+      ROOT: C:\build
+      SDK: C:\php-sdk
+      TREE: phpdev
+      SQLCIPHER: C:\build\sqlcipher
+      OUT: C:\build\out
+      PACKAGE: C:\build\package
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Prepare directories
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:ROOT,$env:OUT,$env:PACKAGE | Out-Null
+
+      - name: Download PHP SDK and create build tree
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch php-sdk-2.7.1 https://github.com/php/php-sdk-binary-tools.git $env:SDK
+
+          $task = @'
+          @echo off
+          cd /d "%SDK%"
+          call phpsdk_buildtree %TREE%
+          exit /b %errorlevel%
+          '@
+
+          $taskPath = "$env:ROOT\buildtree.cmd"
+          Set-Content $taskPath $task -Encoding ascii
+          & cmd.exe /d /s /c "`"$env:SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+          if ($LASTEXITCODE -ne 0) { throw "phpsdk_buildtree failed" }
+
+          $arch = Get-ChildItem "$env:SDK\$env:TREE" -Directory -Recurse |
+            Where-Object { $_.Name -eq 'x64' -and $_.Parent.Name -match '^vs\d+$' } |
+            Select-Object -First 1
+
+          if (-not $arch) { throw "PHP SDK x64 tree not found" }
+
+          $src = Join-Path $arch.FullName 'php-src'
+          $deps = Join-Path $arch.FullName 'deps'
+
+          Add-Content $env:GITHUB_ENV "PHP_SRC=$src"
+          Add-Content $env:GITHUB_ENV "PHP_DEPS=$deps"
+
+      - name: Download sources and PHP dependencies
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "php-$env:PHP_VERSION" https://github.com/php/php-src.git $env:PHP_SRC
+          git clone --depth 1 --branch "v$env:SQLCIPHER_VERSION" https://github.com/sqlcipher/sqlcipher.git $env:SQLCIPHER
+
+          $parts = $env:PHP_VERSION.Split('.')
+          $branch = "$($parts[0]).$($parts[1])"
+
+          $task = @"
+          @echo off
+          cd /d "%PHP_SRC%"
+          call phpsdk_deps --update --branch $branch
+          exit /b %errorlevel%
+          "@
+
+          $taskPath = "$env:ROOT\deps.cmd"
+          Set-Content $taskPath $task -Encoding ascii
+          & cmd.exe /d /s /c "`"$env:SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+          if ($LASTEXITCODE -ne 0) { throw "phpsdk_deps failed" }
+
+          foreach ($file in @(
+            "$env:PHP_DEPS\include\openssl\evp.h",
+            "$env:PHP_DEPS\lib\libcrypto.lib",
+            "$env:PHP_DEPS\lib\libssl.lib"
+          )) {
+            if (-not (Test-Path $file)) { throw "Missing dependency: $file" }
+          }
+
+          Add-Content $env:GITHUB_ENV "OPENSSL_INCLUDE=$env:PHP_DEPS\include"
+          Add-Content $env:GITHUB_ENV "OPENSSL_LIB=$env:PHP_DEPS\lib"
+
+      - name: Generate SQLCipher amalgamation
+        shell: pwsh
+        run: |
+          $makefile = "$env:SQLCIPHER\Makefile.msc"
+          $text = Get-Content $makefile -Raw
+          $text = $text.Replace('/NODEFAULTLIB:msvcrt','').Replace('-NODEFAULTLIB:msvcrt','')
+          Set-Content $makefile $text -Encoding ascii
+
+          $task = @'
+          @echo off
+          cd /d "%SQLCIPHER%"
+          del /q sqlite3.c sqlite3.h sqlite3ext.h lemon.exe lemon.obj jimsh0.exe jimsh0.obj 2>nul
+          nmake /nologo /f Makefile.msc sqlite3.c PLATFORM=x64 USE_CRT_DLL=1 USE_NATIVE_LIBPATHS=1 SYMBOLS=0 DEBUG=0 NO_TCL=1 USE_FULLWARN=0 OPTIMIZATIONS=2
+          exit /b %errorlevel%
+          '@
+
+          $taskPath = "$env:ROOT\amalgamation.cmd"
+          Set-Content $taskPath $task -Encoding ascii
+          & cmd.exe /d /s /c "`"$env:SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+          if ($LASTEXITCODE -ne 0) { throw "SQLCipher amalgamation failed" }
+
+      - name: Compile SQLCipher DLL
+        shell: pwsh
+        run: |
+          $task = @'
+          @echo off
+          cd /d "%SQLCIPHER%"
+          del /q sqlite3.obj sqlite3.dll libsqlite3.lib sqlite3.exp 2>nul
+          cl.exe /nologo /O2 /MD /LD ^
+            /D_CRT_SECURE_NO_WARNINGS=1 ^
+            /DHAVE_STDINT_H=1 ^
+            /DSQLITE_HAS_CODEC=1 ^
+            /DSQLITE_EXTRA_INIT=sqlcipher_extra_init ^
+            /DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown ^
+            /DSQLCIPHER_CRYPTO_OPENSSL=1 ^
+            /DSQLITE_TEMP_STORE=2 ^
+            /DSQLITE_THREADSAFE=1 ^
+            /DSQLITE_ENABLE_COLUMN_METADATA=1 ^
+            /DSQLITE_ENABLE_FTS3=1 ^
+            /DSQLITE_ENABLE_FTS4=1 ^
+            /DSQLITE_ENABLE_FTS5=1 ^
+            /DSQLITE_ENABLE_RTREE=1 ^
+            /DSQLITE_API=__declspec(dllexport) ^
+            /I"%OPENSSL_INCLUDE%" sqlite3.c ^
+            /link /OUT:sqlite3.dll /IMPLIB:libsqlite3.lib ^
+            /LIBPATH:"%OPENSSL_LIB%" ^
+            libcrypto.lib libssl.lib crypt32.lib bcrypt.lib advapi32.lib user32.lib ws2_32.lib
+          exit /b %errorlevel%
+          '@
+
+          $taskPath = "$env:ROOT\sqlcipher.cmd"
+          Set-Content $taskPath $task -Encoding ascii
+          & cmd.exe /d /s /c "`"$env:SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+          if ($LASTEXITCODE -ne 0) { throw "SQLCipher compile failed" }
+
+          foreach ($file in @("$env:SQLCIPHER\sqlite3.dll","$env:SQLCIPHER\libsqlite3.lib")) {
+            if (-not (Test-Path $file)) { throw "Missing SQLCipher output: $file" }
+          }
+
+      - name: Install SQLCipher into PHP dependencies
+        shell: pwsh
+        run: |
+          $inc = "$env:PHP_DEPS\include"
+          $lib = "$env:PHP_DEPS\lib"
+          $bin = "$env:PHP_DEPS\bin"
+
+          Get-ChildItem $lib -Filter '*sqlite*.lib' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          Get-ChildItem $bin -Filter '*sqlite*.dll' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+
+          Copy-Item "$env:SQLCIPHER\sqlite3.h" "$inc\sqlite3.h" -Force
+          Copy-Item "$env:SQLCIPHER\sqlite3ext.h" "$inc\sqlite3ext.h" -Force
+          Copy-Item "$env:SQLCIPHER\libsqlite3.lib" "$lib\libsqlite3.lib" -Force
+          Copy-Item "$env:SQLCIPHER\libsqlite3.lib" "$lib\libsqlite3_a.lib" -Force
+          Copy-Item "$env:SQLCIPHER\sqlite3.dll" "$bin\sqlite3.dll" -Force
+
+      - name: Configure PHP
+        shell: pwsh
+        run: |
+          $task = @'
+          @echo off
+          cd /d "%PHP_SRC%"
+          call buildconf.bat --force
+          if errorlevel 1 exit /b %errorlevel%
+          call configure.bat ^
+            --disable-all ^
+            --disable-zts ^
+            --enable-cli ^
+            --enable-cgi ^
+            --enable-pdo ^
+            --with-sqlite3=shared ^
+            --with-pdo-sqlite=shared ^
+            --with-php-build="%PHP_DEPS%"
+          exit /b %errorlevel%
+          '@
+
+          $taskPath = "$env:ROOT\configure.cmd"
+          Set-Content $taskPath $task -Encoding ascii
+          & cmd.exe /d /s /c "`"$env:SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+          if ($LASTEXITCODE -ne 0) { throw "PHP configure failed" }
+
+          $makefile = Get-Content "$env:PHP_SRC\Makefile" -Raw
+          if ($makefile -notmatch 'php_pdo_sqlite\.dll') { throw "pdo_sqlite not configured" }
+          if ($makefile -notmatch 'php_sqlite3\.dll') { throw "sqlite3 not configured" }
+
+      - name: Compile PHP
+        shell: pwsh
+        run: |
+          $task = @'
+          @echo off
+          cd /d "%PHP_SRC%"
+          nmake
+          exit /b %errorlevel%
+          '@
+
+          $taskPath = "$env:ROOT\nmake.cmd"
+          Set-Content $taskPath $task -Encoding ascii
+          & cmd.exe /d /s /c "`"$env:SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`""
+          if ($LASTEXITCODE -ne 0) { throw "PHP compile failed" }
+
+      - name: Assemble and test
+        shell: pwsh
+        run: |
+          $release = "$env:PHP_SRC\x64\Release"
+          foreach ($file in @(
+            "$release\php.exe",
+            "$release\php_pdo_sqlite.dll",
+            "$release\php_sqlite3.dll"
+          )) {
+            if (-not (Test-Path $file)) { throw "Missing PHP output: $file" }
+          }
+
+          New-Item -ItemType Directory -Force -Path "$env:OUT\ext" | Out-Null
+          Copy-Item "$release\*" $env:OUT -Recurse -Force
+          Copy-Item "$release\php_pdo_sqlite.dll" "$env:OUT\ext\php_pdo_sqlite.dll" -Force
+          Copy-Item "$release\php_sqlite3.dll" "$env:OUT\ext\php_sqlite3.dll" -Force
+          Get-ChildItem "$env:PHP_DEPS\bin" -Filter '*.dll' -File | ForEach-Object { Copy-Item $_.FullName $env:OUT -Force }
+          Copy-Item "$env:SQLCIPHER\sqlite3.dll" "$env:OUT\sqlite3.dll" -Force
+
+          @'
+          [PHP]
+          extension_dir="ext"
+          extension=php_pdo_sqlite.dll
+          extension=php_sqlite3.dll
+          display_errors=On
+          display_startup_errors=On
+          error_reporting=E_ALL
+          '@ | Set-Content "$env:OUT\php.ini" -Encoding ascii
+
+          $test = @'
+          <?php
+          $pdo = new PDO('sqlite::memory:', null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+          $version = $pdo->query('PRAGMA cipher_version')->fetchColumn();
+          if (!is_string($version) || trim($version) === '') {
+              fwrite(STDERR, "SQLCipher unavailable\n");
+              exit(1);
+          }
+          echo "SQLCipher: {$version}\n";
+          '@
+
+          Set-Content "$env:ROOT\test.php" $test -Encoding utf8
+          & "$env:OUT\php.exe" -c "$env:OUT\php.ini" "$env:ROOT\test.php"
+          if ($LASTEXITCODE -ne 0) { throw "SQLCipher PHP test failed" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $zip = "$env:PACKAGE\php-$env:PHP_VERSION-nts-windows-x64-sqlcipher-$env:SQLCIPHER_VERSION.zip"
+          Compress-Archive -Path "$env:OUT\*" -DestinationPath $zip -Force
+          Add-Content $env:GITHUB_ENV "ZIP_PATH=$zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: php-${{ env.PHP_VERSION }}-windows-x64-sqlcipher
+          path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error
+          retention-days: 30
