@@ -79,6 +79,7 @@ jobs:
         run: |
           git clone `
             --depth 1 `
+            --branch php-sdk-2.7.1 `
             https://github.com/php/php-sdk-binary-tools.git `
             $env:PHP_SDK
 
@@ -112,21 +113,43 @@ jobs:
           Get-ChildItem $env:SQLCIPHER_SOURCE |
             Select-Object Name
 
-      - name: Inicializar PHP SDK
-        shell: cmd
+      - name: Descargar dependencias de PHP
+        shell: pwsh
         run: |
-          cd /d %PHP_SDK%
+          $task = @'
+          @echo off
+          cd /d "%PHP_SOURCE%"
+          call phpsdk_deps --update --branch 8.5
+          if errorlevel 1 exit /b %errorlevel%
+          '@
 
-          call phpsdk-vs17-x64.bat
+          $taskPath = Join-Path $env:BUILD_ROOT "deps-task.cmd"
+          Set-Content -Path $taskPath -Value $task -Encoding ascii
 
-          phpsdk_deps --update --branch 8.5
+          & cmd.exe /d /s /c `"`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`"`"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló phpsdk_deps con código $LASTEXITCODE"
+          }
 
       - name: Generar amalgamación SQLCipher
-        shell: cmd
+        shell: pwsh
         run: |
-          cd /d %SQLCIPHER_SOURCE%
-
+          $task = @'
+          @echo off
+          cd /d "%SQLCIPHER_SOURCE%"
           nmake /f Makefile.msc sqlite3.c
+          if errorlevel 1 exit /b %errorlevel%
+          '@
+
+          $taskPath = Join-Path $env:BUILD_ROOT "sqlcipher-task.cmd"
+          Set-Content -Path $taskPath -Value $task -Encoding ascii
+
+          & cmd.exe /d /s /c `"`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`"`"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló la generación de SQLCipher con código $LASTEXITCODE"
+          }
 
       - name: Verificar amalgamación SQLCipher
         shell: pwsh
@@ -192,27 +215,33 @@ jobs:
             Select-Object FullName, Length
 
       - name: Generar configuración de PHP
-        shell: cmd
+        shell: pwsh
         run: |
-          cd /d %PHP_SDK%
-
-          call phpsdk-vs17-x64.bat
-
-          cd /d %PHP_SOURCE%
-
+          $task = @'
+          @echo off
+          cd /d "%PHP_SOURCE%"
           call buildconf.bat --force
+          if errorlevel 1 exit /b %errorlevel%
+          '@
+
+          $taskPath = Join-Path $env:BUILD_ROOT "buildconf-task.cmd"
+          Set-Content -Path $taskPath -Value $task -Encoding ascii
+
+          & cmd.exe /d /s /c `"`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`"`"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló buildconf con código $LASTEXITCODE"
+          }
 
       - name: Configurar PHP
-        shell: cmd
+        shell: pwsh
         run: |
-          cd /d %PHP_SDK%
-
-          call phpsdk-vs17-x64.bat
-
-          cd /d %PHP_SOURCE%
-
-          configure ^
+          $task = @'
+          @echo off
+          cd /d "%PHP_SOURCE%"
+          call configure ^
             --disable-all ^
+            --disable-zts ^
             --enable-cli ^
             --enable-cgi ^
             --enable-pdo ^
@@ -230,9 +259,20 @@ jobs:
             --with-zlib ^
             --with-zip ^
             --with-iconv ^
-            --with-sqlite3 ^
-            --with-pdo-sqlite ^
-            --with-prefix=%OUTPUT_DIRECTORY%
+            --with-sqlite3=shared ^
+            --with-pdo-sqlite=shared ^
+            --with-prefix="%OUTPUT_DIRECTORY%"
+          if errorlevel 1 exit /b %errorlevel%
+          '@
+
+          $taskPath = Join-Path $env:BUILD_ROOT "configure-task.cmd"
+          Set-Content -Path $taskPath -Value $task -Encoding ascii
+
+          & cmd.exe /d /s /c `"`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`"`"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló configure con código $LASTEXITCODE"
+          }
 
       - name: Incorporar definiciones SQLCipher
         shell: pwsh
@@ -270,26 +310,42 @@ jobs:
           }
 
       - name: Compilar PHP
-        shell: cmd
+        shell: pwsh
         run: |
-          cd /d %PHP_SDK%
-
-          call phpsdk-vs17-x64.bat
-
-          cd /d %PHP_SOURCE%
-
+          $task = @'
+          @echo off
+          cd /d "%PHP_SOURCE%"
           nmake
+          if errorlevel 1 exit /b %errorlevel%
+          '@
+
+          $taskPath = Join-Path $env:BUILD_ROOT "nmake-task.cmd"
+          Set-Content -Path $taskPath -Value $task -Encoding ascii
+
+          & cmd.exe /d /s /c `"`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`"`"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló nmake con código $LASTEXITCODE"
+          }
 
       - name: Instalar resultado
-        shell: cmd
+        shell: pwsh
         run: |
-          cd /d %PHP_SDK%
-
-          call phpsdk-vs17-x64.bat
-
-          cd /d %PHP_SOURCE%
-
+          $task = @'
+          @echo off
+          cd /d "%PHP_SOURCE%"
           nmake install
+          if errorlevel 1 exit /b %errorlevel%
+          '@
+
+          $taskPath = Join-Path $env:BUILD_ROOT "install-task.cmd"
+          Set-Content -Path $taskPath -Value $task -Encoding ascii
+
+          & cmd.exe /d /s /c `"`"$env:PHP_SDK\phpsdk-vs17-x64.bat`" -t `"$taskPath`"`"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló nmake install con código $LASTEXITCODE"
+          }
 
       - name: Localizar php.exe
         shell: pwsh
@@ -444,3 +500,4 @@ jobs:
           path: C:\build\php-8.5.zip
           if-no-files-found: error
           retention-days: 14
+
