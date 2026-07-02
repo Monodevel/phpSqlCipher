@@ -47,18 +47,26 @@ jobs:
           Add-Content $env:GITHUB_ENV "INCLUDE=$openssl;$env:INCLUDE"
 
           $spc = "$env:GITHUB_WORKSPACE\spc"
+          $sdk = "$spc\php-sdk-binary-tools"
+          $sdkBin = "$sdk\bin"
+
           New-Item -ItemType Directory -Force -Path "$spc\bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path $sdkBin | Out-Null
+
           Invoke-WebRequest -Uri "https://github.com/crazywhalecc/static-php-cli/releases/download/$env:SPC_VERSION/spc-windows-x64.exe" -OutFile "$spc\bin\spc.exe"
 
-          git clone --depth 1 https://github.com/php/php-sdk-binary-tools.git "$spc\php-sdk-binary-tools"
+          $wrapper = @'
+          @echo off
+          rem Visual Studio 2022 x64 ya fue configurado por ilammy/msvc-dev-cmd.
+          rem SPC 2.8.5 solo necesita que este archivo exista y retorne éxito.
+          exit /b 0
+          '@
+          Set-Content "$sdk\phpsdk-vs17-x64.bat" $wrapper -Encoding ascii
 
-          $sdkBat = "$spc\php-sdk-binary-tools\phpsdk-vs17-x64.bat"
-          $seven = "$spc\php-sdk-binary-tools\bin\7za.exe"
-          if (-not (Test-Path $sdkBat)) { throw "Falta $sdkBat" }
-          if (-not (Test-Path $seven)) {
-            Copy-Item 'C:\Program Files\7-Zip\7z.exe' $seven -Force
-          }
-          if (-not (Test-Path $seven)) { throw "Falta $seven" }
+          Copy-Item 'C:\Program Files\7-Zip\7z.exe' "$sdkBin\7za.exe" -Force
+
+          if (-not (Test-Path "$sdk\phpsdk-vs17-x64.bat")) { throw 'No se pudo crear phpsdk-vs17-x64.bat.' }
+          if (-not (Test-Path "$sdkBin\7za.exe")) { throw 'No se pudo preparar 7za.exe.' }
 
           & "$spc\bin\spc.exe" --version
 
