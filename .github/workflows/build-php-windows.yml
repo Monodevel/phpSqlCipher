@@ -1,4 +1,3 @@
-```yaml
 name: Build PHP with SQLCipher for Windows
 
 on:
@@ -1347,4 +1346,3 @@ jobs:
           path: ${{ env.ZIP_PATH }}
           if-no-files-found: error
           retention-days: 30
-```
