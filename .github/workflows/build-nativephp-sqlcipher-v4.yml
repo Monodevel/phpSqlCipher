@@ -1,0 +1,305 @@
+name: Build NativePHP SQLCipher v4
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-nativephp-sqlcipher-v4.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 240
+
+    env:
+      PHP_BRANCH: "8.5"
+      PHP_VERSION_EXPECTED: "8.5.7"
+      SQLCIPHER_VERSION: "4.16.0"
+      SPC_VERSION: "2.8.5"
+      PHP_EXTENSIONS: bcmath,bz2,ctype,curl,dom,fileinfo,filter,gd,iconv,intl,mbstring,mbregex,opcache,openssl,pdo,pdo_sqlite,phar,session,simplexml,sockets,sodium,sqlite3,tokenizer,xml,zip,zlib
+      PHP_LIBS: bzip2,curl,freetype,iconv,icu,libjpeg,libpng,libxml2,libzip,openssl,sqlite,zlib
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Visual Studio 2022 x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configurar PHP de soporte
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          tools: composer
+          extensions: curl,openssl,mbstring,sodium,tokenizer,filter
+          ini-values: memory_limit=-1
+
+      - name: Verificar herramientas
+        shell: pwsh
+        run: |
+          where.exe cl
+          where.exe nmake
+          where.exe perl
+
+          if ($env:VisualStudioVersion -notmatch '^17\.') {
+            throw "Se requiere Visual Studio 2022."
+          }
+
+          $opensslCandidates = @(
+            "C:\Program Files\OpenSSL\include",
+            "C:\Program Files\OpenSSL-Win64\include",
+            "C:\Program Files\Git\usr\include"
+          )
+
+          $opensslInclude = $opensslCandidates |
+            Where-Object { Test-Path "$_\openssl\evp.h" } |
+            Select-Object -First 1
+
+          if (-not $opensslInclude) {
+            Write-Host "Buscando evp.h en C:\Program Files..."
+            Get-ChildItem "C:\Program Files" -Filter evp.h -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object -First 20 FullName
+            throw "No se encontró un include OpenSSL del sistema."
+          }
+
+          Add-Content $env:GITHUB_ENV "SQLCIPHER_OPENSSL_INCLUDE=$opensslInclude"
+          Add-Content $env:GITHUB_ENV "INCLUDE=$opensslInclude;$env:INCLUDE"
+
+          Write-Host "SQLCIPHER_OPENSSL_INCLUDE=$opensslInclude"
+
+      - name: Descargar static-php-cli
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\spc\bin" | Out-Null
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/crazywhalecc/static-php-cli/releases/download/$env:SPC_VERSION/spc-windows-x64.exe" `
+            -OutFile "$env:GITHUB_WORKSPACE\spc\bin\spc.exe"
+
+          & "$env:GITHUB_WORKSPACE\spc\bin\spc.exe" --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "No se pudo ejecutar static-php-cli."
+          }
+
+      - name: Descargar PHP 8.5 y dependencias NativePHP
+        shell: pwsh
+        working-directory: spc
+        run: |
+          .\bin\spc.exe download `
+            --with-php=$env:PHP_BRANCH `
+            --for-extensions="$env:PHP_EXTENSIONS" `
+            --prefer-pre-built
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló spc download."
+          }
+
+      - name: Extraer SQLite
+        shell: pwsh
+        working-directory: spc
+        run: |
+          .\bin\spc.exe extract sqlite
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló spc extract sqlite."
+          }
+
+          if (-not (Test-Path ".\source\sqlite")) {
+            throw "No existe spc\source\sqlite."
+          }
+
+      - name: Descargar SQLCipher
+        shell: pwsh
+        run: |
+          git clone `
+            --depth 1 `
+            --branch "v$env:SQLCIPHER_VERSION" `
+            https://github.com/sqlcipher/sqlcipher.git `
+            "$env:GITHUB_WORKSPACE\sqlcipher"
+
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\sqlcipher\Makefile.msc")) {
+            throw "No se descargó SQLCipher."
+          }
+
+      - name: Generar amalgamación SQLCipher
+        shell: pwsh
+        run: |
+          $source = "$env:GITHUB_WORKSPACE\sqlcipher"
+          $makefile = "$source\Makefile.msc"
+
+          $text = Get-Content $makefile -Raw
+          $text = $text.Replace('/NODEFAULTLIB:msvcrt', '')
+          $text = $text.Replace('-NODEFAULTLIB:msvcrt', '')
+          Set-Content $makefile $text -Encoding ascii
+
+          Push-Location $source
+          try {
+            nmake /nologo /f Makefile.msc sqlite3.c `
+              PLATFORM=x64 `
+              USE_CRT_DLL=1 `
+              USE_NATIVE_LIBPATHS=1 `
+              SYMBOLS=0 `
+              DEBUG=0 `
+              NO_TCL=1 `
+              USE_FULLWARN=0 `
+              OPTIMIZATIONS=2
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Falló la generación de SQLCipher."
+            }
+          } finally {
+            Pop-Location
+          }
+
+          foreach ($file in @('sqlite3.c','sqlite3.h','sqlite3ext.h')) {
+            if (-not (Test-Path "$source\$file")) {
+              throw "SQLCipher no generó $file."
+            }
+          }
+
+      - name: Sustituir SQLite de SPC por SQLCipher
+        shell: pwsh
+        run: |
+          $sqlcipher = "$env:GITHUB_WORKSPACE\sqlcipher"
+          $sqlite = "$env:GITHUB_WORKSPACE\spc\source\sqlite"
+
+          Copy-Item "$sqlcipher\sqlite3.c" "$sqlite\sqlite3.c" -Force
+          Copy-Item "$sqlcipher\sqlite3.h" "$sqlite\sqlite3.h" -Force
+          Copy-Item "$sqlcipher\sqlite3ext.h" "$sqlite\sqlite3ext.h" -Force
+
+          $file = "$sqlite\sqlite3.c"
+          $body = Get-Content $file -Raw
+
+          $prefix = @'
+          #ifndef SQLITE_HAS_CODEC
+          #define SQLITE_HAS_CODEC 1
+          #endif
+          #ifndef SQLITE_EXTRA_INIT
+          #define SQLITE_EXTRA_INIT sqlcipher_extra_init
+          #endif
+          #ifndef SQLITE_EXTRA_SHUTDOWN
+          #define SQLITE_EXTRA_SHUTDOWN sqlcipher_extra_shutdown
+          #endif
+          #ifndef SQLCIPHER_CRYPTO_OPENSSL
+          #define SQLCIPHER_CRYPTO_OPENSSL 1
+          #endif
+          #ifndef SQLITE_TEMP_STORE
+          #define SQLITE_TEMP_STORE 2
+          #endif
+          '@
+
+          Set-Content $file ($prefix + "`r`n" + $body) -Encoding ascii
+
+          if (-not (Select-String -Path $file -Pattern 'SQLCIPHER_CRYPTO_OPENSSL' -SimpleMatch)) {
+            throw "No se aplicaron las macros SQLCipher."
+          }
+
+      - name: Compilar runtime NativePHP
+        shell: pwsh
+        working-directory: spc
+        run: |
+          .\bin\spc.exe build `
+            --build-cli `
+            "$env:PHP_EXTENSIONS" `
+            --with-libs="$env:PHP_LIBS" `
+            --debug
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló spc build."
+          }
+
+      - name: Validar PHP 8.5.7 NTS y SQLCipher
+        shell: pwsh
+        run: |
+          $php = "$env:GITHUB_WORKSPACE\spc\buildroot\bin\php.exe"
+
+          if (-not (Test-Path $php)) {
+            throw "No se generó php.exe."
+          }
+
+          $version = & $php -r "echo PHP_VERSION;"
+          $zts = & $php -r "echo PHP_ZTS ? 'TS' : 'NTS';"
+          $cipher = & $php -r '$pdo=new PDO("sqlite::memory:"); echo $pdo->query("PRAGMA cipher_version")->fetchColumn();'
+
+          Write-Host "PHP=$version"
+          Write-Host "THREAD_SAFETY=$zts"
+          Write-Host "SQLCIPHER=$cipher"
+
+          if ($version -ne $env:PHP_VERSION_EXPECTED) {
+            throw "Se esperaba PHP $env:PHP_VERSION_EXPECTED y se obtuvo $version."
+          }
+
+          if ($zts -ne 'NTS') {
+            throw "El runtime no es NTS."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "SQLCipher no está activo."
+          }
+
+      - name: Probar cifrado real
+        shell: pwsh
+        run: |
+          $php = "$env:GITHUB_WORKSPACE\spc\buildroot\bin\php.exe"
+          $script = "$env:GITHUB_WORKSPACE\verify-sqlcipher.php"
+
+          @'
+          <?php
+          declare(strict_types=1);
+
+          $path = sys_get_temp_dir().DIRECTORY_SEPARATOR.'nativephp-sqlcipher.sqlite';
+          @unlink($path);
+
+          $pdo = new PDO('sqlite:'.$path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+          $pdo->exec("PRAGMA key='nativephp-key';");
+          $pdo->exec('CREATE TABLE test (value TEXT NOT NULL);');
+          $pdo->exec("INSERT INTO test VALUES ('ok');");
+          unset($pdo);
+
+          $header = file_get_contents($path, false, null, 0, 16);
+          if ($header === false || str_starts_with($header, 'SQLite format 3')) {
+              fwrite(STDERR, "Database is not encrypted\n");
+              exit(1);
+          }
+
+          $pdo = new PDO('sqlite:'.$path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+          $pdo->exec("PRAGMA key='nativephp-key';");
+
+          if ($pdo->query('SELECT value FROM test')->fetchColumn() !== 'ok') {
+              exit(1);
+          }
+
+          echo "Encrypted database verified\n";
+          @unlink($path);
+          '@ | Set-Content $script -Encoding utf8
+
+          & $php $script
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló la prueba de cifrado real."
+          }
+
+      - name: Empaquetar runtime NativePHP
+        shell: pwsh
+        run: |
+          $php = "$env:GITHUB_WORKSPACE\spc\buildroot\bin\php.exe"
+          $dir = "$env:GITHUB_WORKSPACE\dist\bin\win\x64"
+          $zip = "$dir\php-8.5.zip"
+
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Compress-Archive -Path $php -DestinationPath $zip -Force
+          Add-Content $env:GITHUB_ENV "NATIVEPHP_ZIP=$zip"
+
+      - name: Publicar runtime NativePHP
+        uses: actions/upload-artifact@v4
+        with:
+          name: nativephp-php-8.5.7-windows-x64-sqlcipher-4.16.0
+          path: ${{ env.NATIVEPHP_ZIP }}
+          if-no-files-found: error
+          retention-days: 30
