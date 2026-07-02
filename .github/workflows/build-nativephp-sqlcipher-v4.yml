@@ -110,6 +110,15 @@ jobs:
           }
           Get-Content $log -Tail 80
 
+      - name: Publicar log completo de SPC
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spc-build-log
+          path: spc-build.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Validar y empaquetar
         shell: pwsh
         run: |
